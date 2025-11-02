@@ -2,11 +2,11 @@
 #include <WiFi.h>
 #include <WebServer.h>
 
-// ====== WIFI SETTINGS ======
+// WIFI SETTINGS
 const char *ssid = "io";
 const char *password = "hhhhhh90";
 
-// ====== PIN CONFIG for Goouuu ESP32-S3-CAM ======
+// PIN CONFIG for Goouuu ESP32-S3-CAM
 #define PWDN_GPIO_NUM -1
 #define RESET_GPIO_NUM -1
 #define XCLK_GPIO_NUM 40
@@ -27,7 +27,7 @@ const char *password = "hhhhhh90";
 
 WebServer server(80);
 
-// ====== HTTP Handlers ======
+// HTTP Handlers
 void handleRoot()
 {
   server.send(200, "text/html", "<h1>ESP32-S3-CAM Webserver</h1><p><a href=\"/capture\">Take Photo</a></p>");
@@ -55,19 +55,14 @@ void startCameraServer()
   Serial.println("Camera WebServer started!");
 }
 
-// ====== Setup ======
+// Setup
 void setup()
 {
   Serial.begin(115200);
   delay(1000);
-  if (!psramFound())
-  {
-    Serial.println("PSRAM not detected, using internal RAM only");
-  }
 
   Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
 
-  // Kamera-Konfiguration
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -83,16 +78,15 @@ void setup()
   config.pin_pclk = PCLK_GPIO_NUM;
   config.pin_vsync = VSYNC_GPIO_NUM;
   config.pin_href = HREF_GPIO_NUM;
-  config.pin_sscb_sda = SIOD_GPIO_NUM;
-  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
 
-  // Framegröße QVGA = 320x240 (ohne PSRAM)
+  // Framegröße QVGA, kein PSRAM
   config.frame_size = FRAMESIZE_QVGA;
-  config.jpeg_quality = 20; // weniger Speicherverbrauch
   config.fb_count = 1;
 
   // Kamera initialisieren
@@ -103,7 +97,7 @@ void setup()
     return;
   }
 
-  // Mit WLAN verbinden
+  // WLAN verbinden
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED)
@@ -118,7 +112,6 @@ void setup()
   startCameraServer();
 }
 
-// ====== Loop ======
 void loop()
 {
   server.handleClient();
