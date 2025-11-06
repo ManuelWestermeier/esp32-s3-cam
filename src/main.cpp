@@ -162,7 +162,6 @@ void setup()
     Serial.printf("✅ PSRAM found, size = %u bytes\n", ESP.getPsramSize());
   }
 
-
   Serial.println("ESP32-S3-CAM + SD demo");
 
   // pinMode(LED_ON, OUTPUT);
