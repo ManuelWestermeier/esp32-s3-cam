@@ -1,208 +1,281 @@
-#include "Arduino.h"
+// CameraWebServer for ESP32-S3 (select one camera model below)
+//
+// NOTE: Edit ssid/password below before uploading.
+// If your board uses a different camera model, replace the uncommented line
+// with the correct `#define CAMERA_MODEL_...` for your board.
+
+// #define CAMERA_MODEL_WROVER_KIT // Has PSRAM
+// #define CAMERA_MODEL_ESP_EYE  // Has PSRAM
+#define CAMERA_MODEL_ESP32S3_EYE  // Has PSRAM   <-- SELECTED for ESP32-S3 \
+                                  // #define CAMERA_MODEL_M5STACK_PSRAM // Has PSRAM \
+                                  // #define CAMERA_MODEL_M5STACK_V2_PSRAM // M5Camera version B Has PSRAM \
+                                  // #define CAMERA_MODEL_M5STACK_WIDE // Has PSRAM \
+                                  // #define CAMERA_MODEL_M5STACK_ESP32CAM // No PSRAM \
+                                  // #define CAMERA_MODEL_M5STACK_UNITCAM // No PSRAM \
+                                  // #define CAMERA_MODEL_M5STACK_CAMS3_UNIT  // Has PSRAM \
+                                  // #define CAMERA_MODEL_AI_THINKER // Has PSRAM \
+                                  // #define CAMERA_MODEL_TTGO_T_JOURNAL // No PSRAM \
+                                  // #define CAMERA_MODEL_XIAO_ESP32S3 // Has PSRAM \
+                                  // ** Espressif Internal Boards ** \
+                                  // #define CAMERA_MODEL_ESP32_CAM_BOARD \
+                                  // #define CAMERA_MODEL_ESP32S2_CAM_BOARD \
+                                  // #define CAMERA_MODEL_ESP32S3_CAM_LCD \
+                                  // #define CAMERA_MODEL_DFRobot_FireBeetle2_ESP32S3 // Has PSRAM \
+                                  // #define CAMERA_MODEL_DFRobot_Romeo_ESP32S3 // Has PSRAM
+
 #include "esp_camera.h"
-#include "SD_MMC.h"
-#include "WiFi.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <esp_timer.h>
+#include <Arduino.h>
+#include "camera_pins.h"  // uses the selected CAMERA_MODEL_... define
 
-// =====================
-// Pin definitions (from your ESP32-S3-CAM-N16R8 GOOUUU pinout)
-// =====================
-#define CAM_XCLK 15
-#define CAM_PCLK 13
-#define CAM_VSYNC 6
-#define CAM_HREF 7
-#define CAM_SIOD 4 // SDA
-#define CAM_SIOC 5 // SCL
-#define CAM_Y9 16
-#define CAM_Y8 17
-#define CAM_Y7 18
-#define CAM_Y6 12
-#define CAM_Y5 10
-#define CAM_Y4 8
-#define CAM_Y3 9
-#define CAM_Y2 11
+//
+// Replace with your WiFi credentials
+//
+const char* ssid = "io";
+const char* password = "hhhhhh90";
 
-#define SD_CMD 38
-#define SD_CLK 39
-#define SD_DATA 40
+WebServer server(80);
 
-// #define LED_ON    45
-// #define LED_RGB   47
+// ----------------------------------------------------------------------------
+// Simple index page (shows snapshot + stream link)
+const char* INDEX_HTML = R"rawliteral(
+<html>
+  <head>
+    <title>ESP32 Camera</title>
+  </head>
+  <body>
+    <h1>ESP32 Camera Web Server</h1>
+    <p><a href="/stream">MJPEG Stream</a></p>
+    <p><img src="/jpg" width="320" /></p>
+    <p><a href="/capture">Download Last Capture (jpg)</a></p>
+  </body>
+</html>
+)rawliteral";
 
-// =====================
-// Wi-Fi
-// =====================
-const char *ssid = "ESP32S3_CAM_AP";
-const char *password = "12345678";
+// ----------------------------------------------------------------------------
+// Helpers: send single JPEG frame
+void handle_jpg() {
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    server.send(500, "text/plain", "Camera capture failed");
+    return;
+  }
+  server.sendHeader("Content-Type", "image/jpeg");
+  server.sendHeader("Content-Length", String(fb->len));
+  WiFiClient client = server.client();
+  client.write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
 
-// =====================
-// Camera configuration
-// =====================
-camera_config_t config = {
-    .pin_pwdn = -1,
-    .pin_reset = -1,
-    .pin_xclk = CAM_XCLK,
-    .pin_sscb_sda = CAM_SIOD,
-    .pin_sscb_scl = CAM_SIOC,
-    .pin_d7 = CAM_Y9,
-    .pin_d6 = CAM_Y8,
-    .pin_d5 = CAM_Y7,
-    .pin_d4 = CAM_Y6,
-    .pin_d3 = CAM_Y5,
-    .pin_d2 = CAM_Y4,
-    .pin_d1 = CAM_Y3,
-    .pin_d0 = CAM_Y2,
-    .pin_vsync = CAM_VSYNC,
-    .pin_href = CAM_HREF,
-    .pin_pclk = CAM_PCLK,
-    .xclk_freq_hz = 10000000, // lower clock = more reliable on S3
-    .ledc_timer = LEDC_TIMER_0,
-    .ledc_channel = LEDC_CHANNEL_0,
-    .pixel_format = PIXFORMAT_JPEG,
-    .frame_size = FRAMESIZE_VGA,
-    .jpeg_quality = 12,
-    .fb_count = 1,
-    .grab_mode = CAMERA_GRAB_LATEST};
+// Stream handler (multipart/x-mixed-replace)
+void handle_stream() {
+  WiFiClient client = server.client();
 
-// =====================
-// HTTP server for streaming
-// =====================
-#include "esp_http_server.h"
-static httpd_handle_t stream_httpd = NULL;
+  String boundary = "frameboundary";
+  server.sendHeader("Cache-Control", "no-cache");
+  server.sendHeader("Pragma", "no-cache");
+  client.printf("Content-Type: image/jpeg\r\n");
+  server.sendHeader("Connection", "close");
+  server.sendHeader("Content-Type", "multipart/x-mixed-replace; boundary=" + boundary);
 
-static esp_err_t stream_handler(httpd_req_t *req)
-{
-  camera_fb_t *fb = NULL;
-  esp_err_t res = ESP_OK;
+  // we must not call server.send() here because we will directly write stream bytes to client
+  // send initial boundary
+  client.print("--" + boundary + "\r\n");
 
-  res = httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
-  if (res != ESP_OK)
-    return res;
-
-  static const char *_boundary = "\r\n--frame\r\n";
-  static const char *_jpg_hdr = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
-
-  while (true)
-  {
-    fb = esp_camera_fb_get();
-    if (!fb)
-    {
+  while (client.connected()) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
       Serial.println("Camera capture failed");
       break;
     }
-    char header[64];
-    size_t hlen = snprintf(header, 64, _jpg_hdr, fb->len);
-    httpd_resp_send_chunk(req, _boundary, strlen(_boundary));
-    httpd_resp_send_chunk(req, header, hlen);
-    httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+
+    client.printf("Content-Type: image/jpeg\r\n");
+    client.printf("Content-Length: %u\r\n\r\n", (unsigned)fb->len);
+    client.write(fb->buf, fb->len);
+    client.print("\r\n--" + boundary + "\r\n");
+
     esp_camera_fb_return(fb);
-  }
 
-  return res;
+    // small delay to allow other tasks to run (tweak for FPS)
+    if (!client.connected()) break;
+    delay(10);
+  }
 }
 
-static esp_err_t snapshot_handler(httpd_req_t *req)
-{
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb)
-  {
-    httpd_resp_send_500(req);
-    return ESP_FAIL;
+// Simple capture that triggers a download (same as /jpg but with content-disposition)
+void handle_capture() {
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    server.send(500, "text/plain", "Camera capture failed");
+    return;
   }
-
-  File file = SD_MMC.open("/capture.jpg", FILE_WRITE);
-  if (file)
-  {
-    file.write(fb->buf, fb->len);
-    file.close();
-    Serial.println("Saved /capture.jpg to SD card");
-  }
-  else
-  {
-    Serial.println("SD write failed!");
-  }
-
-  httpd_resp_set_type(req, "image/jpeg");
-  httpd_resp_send(req, (const char *)fb->buf, fb->len);
+  server.sendHeader("Content-Disposition", "attachment; filename=capture.jpg");
+  server.sendHeader("Content-Type", "image/jpeg");
+  server.sendHeader("Content-Length", String(fb->len));
+  WiFiClient client = server.client();
+  client.write(fb->buf, fb->len);
   esp_camera_fb_return(fb);
-  return ESP_OK;
 }
 
-void startServer()
-{
-  httpd_config_t conf = HTTPD_DEFAULT_CONFIG();
-  httpd_uri_t stream_uri = {
-      .uri = "/",
-      .method = HTTP_GET,
-      .handler = stream_handler,
-      .user_ctx = NULL};
-  httpd_uri_t shot_uri = {
-      .uri = "/capture",
-      .method = HTTP_GET,
-      .handler = snapshot_handler,
-      .user_ctx = NULL};
-  if (httpd_start(&stream_httpd, &conf) == ESP_OK)
-  {
-    httpd_register_uri_handler(stream_httpd, &stream_uri);
-    httpd_register_uri_handler(stream_httpd, &shot_uri);
-  }
+void handle_root() {
+  server.send_P(200, "text/html", INDEX_HTML);
 }
-// =====================
-// SETUP
-// =====================
-void setup()
-{
+
+void handle_not_found() {
+  String message = "File Not Found\n\n";
+  message += "URI: ";
+  message += server.uri();
+  message += "\nMethod: ";
+  message += (server.method() == HTTP_GET) ? "GET" : "POST";
+  message += "\nArguments: ";
+  message += server.args();
+  message += "\n";
+  server.send(404, "text/plain", message);
+}
+
+// ----------------------------------------------------------------------------
+// Optional: setup LED flash pin if camera_pins.h defines LED_GPIO_NUM
+void setupLedFlash(int pin) {
+#if defined(LED_GPIO_NUM)
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, LOW);
+#endif
+}
+
+// ----------------------------------------------------------------------------
+void startCameraServer() {
+  server.on("/", HTTP_GET, handle_root);
+  server.on("/jpg", HTTP_GET, handle_jpg);
+  server.on("/capture", HTTP_GET, handle_capture);
+
+  // streaming: use a lambda that runs in current connection context
+  server.on("/stream", HTTP_GET, []() {
+    // Important: call handle_stream directly so we can stream a multipart response
+    handle_stream();
+  });
+
+  server.onNotFound(handle_not_found);
+
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+// ----------------------------------------------------------------------------
+void setup() {
   Serial.begin(115200);
-  delay(500);
-  if (!psramFound())
-  {
+  if (!psramFound()) {
     Serial.println("❌ PSRAM not found!");
-  }
-  else
-  {
+  } else {
     Serial.printf("✅ PSRAM found, size = %u bytes\n", ESP.getPsramSize());
   }
 
   Serial.println("ESP32-S3-CAM + SD demo");
+  Serial.setDebugOutput(true);
+  Serial.println();
+  Serial.println("Starting camera...");
 
-  // pinMode(LED_ON, OUTPUT);
-  // digitalWrite(LED_ON, HIGH);
-
-  config.frame_size = FRAMESIZE_QVGA; // Statt VGA
-  config.jpeg_quality = 15;           // Etwas schlechtere Qualität
-  config.fb_count = 1;                // Nur ein Framebuffer
-  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
-
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;  // for streaming
+  config.frame_size = FRAMESIZE_UXGA;
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
 
-  // Init camera
+  if (config.pixel_format == PIXFORMAT_JPEG) {
+    if (psramFound()) {
+      config.jpeg_quality = 10;
+      config.fb_count = 2;
+      config.grab_mode = CAMERA_GRAB_LATEST;
+    } else {
+      config.frame_size = FRAMESIZE_SVGA;
+      config.fb_location = CAMERA_FB_IN_DRAM;
+    }
+  } else {
+    config.frame_size = FRAMESIZE_240X240;
+#if CONFIG_IDF_TARGET_ESP32S3
+    config.fb_count = 2;
+#endif
+  }
+
+#if defined(CAMERA_MODEL_ESP_EYE)
+  pinMode(13, INPUT_PULLUP);
+  pinMode(14, INPUT_PULLUP);
+#endif
+
+  // camera init
   esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK)
-  {
-    Serial.printf("Camera init failed: 0x%x\n", err);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x\n", err);
     return;
   }
-  Serial.println("Camera initialized");
 
-  // Init SD
-  if (!SD_MMC.begin("/sdcard", true))
-  {
-    Serial.println("SD_MMC mount failed!");
-  }
-  else
-  {
-    Serial.printf("SD card OK, %llu MB\n", SD_MMC.cardSize() / (1024 * 1024));
+  sensor_t* s = esp_camera_sensor_get();
+  if (s->id.PID == OV3660_PID) {
+    s->set_vflip(s, 1);
+    s->set_brightness(s, 1);
+    s->set_saturation(s, -2);
   }
 
-  // WiFi AP
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(ssid, password);
-  IPAddress ip = WiFi.softAPIP();
-  Serial.printf("AP started: %s  IP: %s\n", ssid, ip.toString().c_str());
+  if (config.pixel_format == PIXFORMAT_JPEG) {
+    s->set_framesize(s, FRAMESIZE_QVGA);
+  }
 
-  startServer();
+#if defined(CAMERA_MODEL_M5STACK_WIDE) || defined(CAMERA_MODEL_M5STACK_ESP32CAM)
+  s->set_vflip(s, 1);
+  s->set_hmirror(s, 1);
+#endif
 
-  Serial.printf("Stream:  http://%s/\n", ip.toString().c_str());
-  Serial.printf("Capture: http://%s/capture\n", ip.toString().c_str());
+#if defined(CAMERA_MODEL_ESP32S3_EYE)
+  s->set_vflip(s, 1);
+#endif
+
+#if defined(LED_GPIO_NUM)
+  setupLedFlash(LED_GPIO_NUM);
+#endif
+
+  WiFi.begin(ssid, password);
+  WiFi.setSleep(false);
+
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("WiFi connected. IP: ");
+  Serial.println(WiFi.localIP());
+
+  startCameraServer();
+
+  Serial.println("Camera Ready! Use 'http://");
+  Serial.print(WiFi.localIP());
+  Serial.println("' to connect");
 }
 
-void loop() {}
+void loop() {
+  // If you use WebServer (synchronous), you must call handleClient() often
+  server.handleClient();
+  delay(2);
+}
